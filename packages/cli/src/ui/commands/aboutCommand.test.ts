@@ -10,8 +10,23 @@ import { type CommandContext } from './types.js';
 import { createMockCommandContext } from '../../test-utils/mockCommandContext.js';
 import * as versionUtils from '../../utils/version.js';
 import { MessageType } from '../types.js';
+import { IdeClient } from '@google/gemini-cli-core';
 
-import { IdeClient } from '../../../../core/src/ide/ide-client.js';
+vi.mock('@google/gemini-cli-core', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('@google/gemini-cli-core')>();
+  return {
+    ...actual,
+    IdeClient: {
+      getInstance: vi.fn().mockResolvedValue({
+        getDetectedIdeDisplayName: vi.fn().mockReturnValue('test-ide'),
+      }),
+    },
+    UserAccountManager: vi.fn().mockImplementation(() => ({
+      getCachedGoogleAccount: vi.fn().mockReturnValue('test-email@example.com'),
+    })),
+  };
+});
 
 vi.mock('../../utils/version.js', () => ({
   getCliVersion: vi.fn(),
@@ -27,12 +42,15 @@ describe('aboutCommand', () => {
       services: {
         config: {
           getModel: vi.fn(),
-          getIdeClient: vi.fn(),
           getIdeMode: vi.fn().mockReturnValue(true),
         },
         settings: {
           merged: {
-            selectedAuthType: 'test-auth',
+            security: {
+              auth: {
+                selectedType: 'test-auth',
+              },
+            },
           },
         },
       },
@@ -49,9 +67,6 @@ describe('aboutCommand', () => {
     Object.defineProperty(process, 'platform', {
       value: 'test-os',
     });
-    vi.spyOn(mockContext.services.config!, 'getIdeClient').mockReturnValue({
-      getDetectedIdeDisplayName: vi.fn().mockReturnValue('test-ide'),
-    } as Partial<IdeClient> as IdeClient);
   });
 
   afterEach(() => {
@@ -65,7 +80,7 @@ describe('aboutCommand', () => {
 
   it('should have the correct name and description', () => {
     expect(aboutCommand.name).toBe('about');
-    expect(aboutCommand.description).toBe('show version info');
+    expect(aboutCommand.description).toBe('Show version info');
   });
 
   it('should call addItem with all version info', async () => {
@@ -86,6 +101,7 @@ describe('aboutCommand', () => {
         selectedAuthType: 'test-auth',
         gcpProject: 'test-gcp-project',
         ideClient: 'test-ide',
+        userEmail: 'test-email@example.com',
       },
       expect.any(Number),
     );
@@ -125,11 +141,11 @@ describe('aboutCommand', () => {
   });
 
   it('should not show ide client when it is not detected', async () => {
-    vi.spyOn(mockContext.services.config!, 'getIdeClient').mockReturnValue({
+    vi.mocked(IdeClient.getInstance).mockResolvedValue({
       getDetectedIdeDisplayName: vi.fn().mockReturnValue(undefined),
-    } as Partial<IdeClient> as IdeClient);
+    } as unknown as IdeClient);
 
-    process.env.SANDBOX = '';
+    process.env['SANDBOX'] = '';
     if (!aboutCommand.action) {
       throw new Error('The about command must have an action.');
     }

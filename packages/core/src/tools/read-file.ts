@@ -4,36 +4,32 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import path from 'path';
+import type { MessageBus } from '../confirmation-bus/message-bus.js';
+import path from 'node:path';
 import { makeRelative, shortenPath } from '../utils/paths.js';
-import {
-  BaseDeclarativeTool,
-  BaseToolInvocation,
-  Kind,
-  ToolInvocation,
-  ToolLocation,
-  ToolResult,
-} from './tools.js';
-import { ToolErrorType } from './tool-error.js';
-import { PartUnion } from '@google/genai';
+import type { ToolInvocation, ToolLocation, ToolResult } from './tools.js';
+import { BaseDeclarativeTool, BaseToolInvocation, Kind } from './tools.js';
+
+import type { PartUnion } from '@google/genai';
 import {
   processSingleFileContent,
   getSpecificMimeType,
 } from '../utils/fileUtils.js';
-import { Config } from '../config/config.js';
-import {
-  recordFileOperationMetric,
-  FileOperation,
-} from '../telemetry/metrics.js';
+import type { Config } from '../config/config.js';
+import { FileOperation } from '../telemetry/metrics.js';
+import { getProgrammingLanguage } from '../telemetry/telemetry-utils.js';
+import { logFileOperation } from '../telemetry/loggers.js';
+import { FileOperationEvent } from '../telemetry/types.js';
+import { READ_FILE_TOOL_NAME } from './tool-names.js';
 
 /**
  * Parameters for the ReadFile tool
  */
 export interface ReadFileToolParams {
   /**
-   * The absolute path to the file to read
+   * The path to the file to read
    */
-  absolute_path: string;
+  file_path: string;
 
   /**
    * The line number to start reading from (optional)
@@ -50,28 +46,36 @@ class ReadFileToolInvocation extends BaseToolInvocation<
   ReadFileToolParams,
   ToolResult
 > {
+  private readonly resolvedPath: string;
   constructor(
     private config: Config,
     params: ReadFileToolParams,
+    messageBus?: MessageBus,
+    _toolName?: string,
+    _toolDisplayName?: string,
   ) {
-    super(params);
+    super(params, messageBus, _toolName, _toolDisplayName);
+    this.resolvedPath = path.resolve(
+      this.config.getTargetDir(),
+      this.params.file_path,
+    );
   }
 
   getDescription(): string {
     const relativePath = makeRelative(
-      this.params.absolute_path,
+      this.resolvedPath,
       this.config.getTargetDir(),
     );
     return shortenPath(relativePath);
   }
 
   override toolLocations(): ToolLocation[] {
-    return [{ path: this.params.absolute_path, line: this.params.offset }];
+    return [{ path: this.resolvedPath, line: this.params.offset }];
   }
 
   async execute(): Promise<ToolResult> {
     const result = await processSingleFileContent(
-      this.params.absolute_path,
+      this.resolvedPath,
       this.config.getTargetDir(),
       this.config.getFileSystemService(),
       this.params.offset,
@@ -79,44 +83,12 @@ class ReadFileToolInvocation extends BaseToolInvocation<
     );
 
     if (result.error) {
-      // Map error messages to ToolErrorType
-      let errorType: ToolErrorType;
-      let llmContent: string;
-
-      // Check error message patterns to determine error type
-      if (
-        result.error.includes('File not found') ||
-        result.error.includes('does not exist') ||
-        result.error.includes('ENOENT')
-      ) {
-        errorType = ToolErrorType.FILE_NOT_FOUND;
-        llmContent =
-          'Could not read file because no file was found at the specified path.';
-      } else if (
-        result.error.includes('is a directory') ||
-        result.error.includes('EISDIR')
-      ) {
-        errorType = ToolErrorType.INVALID_TOOL_PARAMS;
-        llmContent =
-          'Could not read file because the provided path is a directory, not a file.';
-      } else if (
-        result.error.includes('too large') ||
-        result.error.includes('File size exceeds')
-      ) {
-        errorType = ToolErrorType.FILE_TOO_LARGE;
-        llmContent = `Could not read file. ${result.error}`;
-      } else {
-        // Other read errors map to READ_CONTENT_FAILURE
-        errorType = ToolErrorType.READ_CONTENT_FAILURE;
-        llmContent = `Could not read file. ${result.error}`;
-      }
-
       return {
-        llmContent,
+        llmContent: result.llmContent,
         returnDisplay: result.returnDisplay || 'Error reading file',
         error: {
           message: result.error,
-          type: errorType,
+          type: result.errorType,
         },
       };
     }
@@ -143,13 +115,20 @@ ${result.llmContent}`;
       typeof result.llmContent === 'string'
         ? result.llmContent.split('\n').length
         : undefined;
-    const mimetype = getSpecificMimeType(this.params.absolute_path);
-    recordFileOperationMetric(
+    const mimetype = getSpecificMimeType(this.resolvedPath);
+    const programming_language = getProgrammingLanguage({
+      file_path: this.resolvedPath,
+    });
+    logFileOperation(
       this.config,
-      FileOperation.READ,
-      lines,
-      mimetype,
-      path.extname(this.params.absolute_path),
+      new FileOperationEvent(
+        READ_FILE_TOOL_NAME,
+        FileOperation.READ,
+        lines,
+        mimetype,
+        path.extname(this.resolvedPath),
+        programming_language,
+      ),
     );
 
     return {
@@ -166,19 +145,21 @@ export class ReadFileTool extends BaseDeclarativeTool<
   ReadFileToolParams,
   ToolResult
 > {
-  static readonly Name: string = 'read_file';
+  static readonly Name = READ_FILE_TOOL_NAME;
 
-  constructor(private config: Config) {
+  constructor(
+    private config: Config,
+    messageBus?: MessageBus,
+  ) {
     super(
       ReadFileTool.Name,
       'ReadFile',
-      `Reads and returns the content of a specified file. If the file is large, the content will be truncated. The tool's response will clearly indicate if truncation has occurred and will provide details on how to read more of the file using the 'offset' and 'limit' parameters. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), and PDF files. For text files, it can read specific line ranges.`,
+      `Reads and returns the content of a specified file. If the file is large, the content will be truncated. The tool's response will clearly indicate if truncation has occurred and will provide details on how to read more of the file using the 'offset' and 'limit' parameters. Handles text, images (PNG, JPG, GIF, WEBP, SVG, BMP), audio files (MP3, WAV, AIFF, AAC, OGG, FLAC), and PDF files. For text files, it can read specific line ranges.`,
       Kind.Read,
       {
         properties: {
-          absolute_path: {
-            description:
-              "The absolute path to the file to read (e.g., '/home/user/project/file.txt'). Relative paths are not supported. You must provide an absolute path.",
+          file_path: {
+            description: 'The path to the file to read.',
             type: 'string',
           },
           offset: {
@@ -192,28 +173,39 @@ export class ReadFileTool extends BaseDeclarativeTool<
             type: 'number',
           },
         },
-        required: ['absolute_path'],
+        required: ['file_path'],
         type: 'object',
       },
+      true,
+      false,
+      messageBus,
     );
   }
 
   protected override validateToolParamValues(
     params: ReadFileToolParams,
   ): string | null {
-    const filePath = params.absolute_path;
-    if (params.absolute_path.trim() === '') {
-      return "The 'absolute_path' parameter must be non-empty.";
-    }
-
-    if (!path.isAbsolute(filePath)) {
-      return `File path must be absolute, but was relative: ${filePath}. You must provide an absolute path.`;
+    if (params.file_path.trim() === '') {
+      return "The 'file_path' parameter must be non-empty.";
     }
 
     const workspaceContext = this.config.getWorkspaceContext();
-    if (!workspaceContext.isPathWithinWorkspace(filePath)) {
+    const projectTempDir = this.config.storage.getProjectTempDir();
+    const resolvedPath = path.resolve(
+      this.config.getTargetDir(),
+      params.file_path,
+    );
+    const resolvedProjectTempDir = path.resolve(projectTempDir);
+    const isWithinTempDir =
+      resolvedPath.startsWith(resolvedProjectTempDir + path.sep) ||
+      resolvedPath === resolvedProjectTempDir;
+
+    if (
+      !workspaceContext.isPathWithinWorkspace(resolvedPath) &&
+      !isWithinTempDir
+    ) {
       const directories = workspaceContext.getDirectories();
-      return `File path must be within one of the workspace directories: ${directories.join(', ')}`;
+      return `File path must be within one of the workspace directories: ${directories.join(', ')} or within the project temp directory: ${projectTempDir}`;
     }
     if (params.offset !== undefined && params.offset < 0) {
       return 'Offset must be a non-negative number';
@@ -223,8 +215,9 @@ export class ReadFileTool extends BaseDeclarativeTool<
     }
 
     const fileService = this.config.getFileService();
-    if (fileService.shouldGeminiIgnoreFile(params.absolute_path)) {
-      return `File path '${filePath}' is ignored by .geminiignore pattern(s).`;
+    const fileFilteringOptions = this.config.getFileFilteringOptions();
+    if (fileService.shouldIgnoreFile(resolvedPath, fileFilteringOptions)) {
+      return `File path '${resolvedPath}' is ignored by configured ignore patterns.`;
     }
 
     return null;
@@ -232,7 +225,16 @@ export class ReadFileTool extends BaseDeclarativeTool<
 
   protected createInvocation(
     params: ReadFileToolParams,
+    messageBus?: MessageBus,
+    _toolName?: string,
+    _toolDisplayName?: string,
   ): ToolInvocation<ReadFileToolParams, ToolResult> {
-    return new ReadFileToolInvocation(this.config, params);
+    return new ReadFileToolInvocation(
+      this.config,
+      params,
+      messageBus,
+      _toolName,
+      _toolDisplayName,
+    );
   }
 }

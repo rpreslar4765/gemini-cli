@@ -4,24 +4,28 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import * as fs from 'node:fs';
+
 let detectionComplete = false;
-let protocolSupported = false;
-let protocolEnabled = false;
+
+let kittySupported = false;
+
+let kittyEnabled = false;
 
 /**
  * Detects Kitty keyboard protocol support.
  * Definitive document about this protocol lives at https://sw.kovidgoyal.net/kitty/keyboard-protocol/
  * This function should be called once at app startup.
  */
-export async function detectAndEnableKittyProtocol(): Promise<boolean> {
+export async function detectAndEnableKittyProtocol(): Promise<void> {
   if (detectionComplete) {
-    return protocolSupported;
+    return;
   }
 
   return new Promise((resolve) => {
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
       detectionComplete = true;
-      resolve(false);
+      resolve();
       return;
     }
 
@@ -32,74 +36,98 @@ export async function detectAndEnableKittyProtocol(): Promise<boolean> {
 
     let responseBuffer = '';
     let progressiveEnhancementReceived = false;
-    let checkFinished = false;
+    let timeoutId: NodeJS.Timeout | undefined;
+
+    const finish = () => {
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+        timeoutId = undefined;
+      }
+      process.stdin.removeListener('data', handleData);
+      if (!originalRawMode) {
+        process.stdin.setRawMode(false);
+      }
+
+      if (kittySupported) {
+        enableSupportedProtocol();
+        process.on('exit', disableAllProtocols);
+        process.on('SIGTERM', disableAllProtocols);
+      }
+
+      detectionComplete = true;
+      resolve();
+    };
 
     const handleData = (data: Buffer) => {
+      if (timeoutId === undefined) {
+        // Race condition. We have already timed out.
+        return;
+      }
       responseBuffer += data.toString();
 
       // Check for progressive enhancement response (CSI ? <flags> u)
       if (responseBuffer.includes('\x1b[?') && responseBuffer.includes('u')) {
         progressiveEnhancementReceived = true;
+        // Give more time to get the full set of kitty responses if we have an
+        // indication the terminal probably supports kitty and we just need to
+        // wait a bit longer for a response.
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(finish, 1000);
       }
 
       // Check for device attributes response (CSI ? <attrs> c)
       if (responseBuffer.includes('\x1b[?') && responseBuffer.includes('c')) {
-        if (!checkFinished) {
-          checkFinished = true;
-          process.stdin.removeListener('data', handleData);
-
-          if (!originalRawMode) {
-            process.stdin.setRawMode(false);
-          }
-
-          if (progressiveEnhancementReceived) {
-            // Enable the protocol
-            process.stdout.write('\x1b[>1u');
-            protocolSupported = true;
-            protocolEnabled = true;
-
-            // Set up cleanup on exit
-            process.on('exit', disableProtocol);
-            process.on('SIGTERM', disableProtocol);
-          }
-
-          detectionComplete = true;
-          resolve(protocolSupported);
+        if (progressiveEnhancementReceived) {
+          kittySupported = true;
         }
+
+        finish();
       }
     };
 
     process.stdin.on('data', handleData);
 
-    // Send queries
-    process.stdout.write('\x1b[?u'); // Query progressive enhancement
-    process.stdout.write('\x1b[c'); // Query device attributes
+    // Query progressive enhancement and device attributes
+    fs.writeSync(process.stdout.fd, '\x1b[?u\x1b[c');
 
-    // Timeout after 50ms
-    setTimeout(() => {
-      if (!checkFinished) {
-        process.stdin.removeListener('data', handleData);
-        if (!originalRawMode) {
-          process.stdin.setRawMode(false);
-        }
-        detectionComplete = true;
-        resolve(false);
-      }
-    }, 50);
+    // Timeout after 200ms
+    // When a iterm2 terminal does not have focus this can take over 90s on a
+    // fast macbook so we need a somewhat longer threshold than would be ideal.
+    timeoutId = setTimeout(finish, 200);
   });
 }
 
-function disableProtocol() {
-  if (protocolEnabled) {
-    process.stdout.write('\x1b[<u');
-    protocolEnabled = false;
+import {
+  enableKittyKeyboardProtocol,
+  disableKittyKeyboardProtocol,
+} from '@google/gemini-cli-core';
+
+export function isKittyProtocolEnabled(): boolean {
+  return kittyEnabled;
+}
+
+function disableAllProtocols() {
+  try {
+    if (kittyEnabled) {
+      disableKittyKeyboardProtocol();
+      kittyEnabled = false;
+    }
+  } catch {
+    // Ignore
   }
 }
 
-export function isKittyProtocolEnabled(): boolean {
-  return protocolEnabled;
-}
-
-export function isKittyProtocolSupported(): boolean {
-  return protocolSupported;
+/**
+ * This is exported so we can reenable this after exiting an editor which might
+ * change the mode.
+ */
+export function enableSupportedProtocol(): void {
+  try {
+    if (kittySupported) {
+      enableKittyKeyboardProtocol();
+      kittyEnabled = true;
+    }
+  } catch {
+    // Ignore
+  }
 }

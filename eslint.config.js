@@ -10,9 +10,10 @@ import reactPlugin from 'eslint-plugin-react';
 import reactHooks from 'eslint-plugin-react-hooks';
 import prettierConfig from 'eslint-config-prettier';
 import importPlugin from 'eslint-plugin-import';
+import vitest from '@vitest/eslint-plugin';
 import globals from 'globals';
 import licenseHeader from 'eslint-plugin-license-header';
-import path from 'node:path'; // Use node: prefix for built-ins
+import path from 'node:path';
 import url from 'node:url';
 
 // --- ESM way to get __dirname ---
@@ -28,12 +29,12 @@ export default tseslint.config(
     // Global ignores
     ignores: [
       'node_modules/*',
-      '.integration-tests/**',
       'eslint.config.js',
       'packages/**/dist/**',
       'bundle/**',
       'package/bundle/**',
       '.integration-tests/**',
+      'dist/**',
     ],
   },
   eslint.configs.recommended,
@@ -79,6 +80,11 @@ export default tseslint.config(
       },
     },
     languageOptions: {
+      parser: tseslint.parser,
+      parserOptions: {
+        projectService: true,
+        tsconfigRootDir: projectRoot,
+      },
       globals: {
         ...globals.node,
         ...globals.es2021,
@@ -103,6 +109,10 @@ export default tseslint.config(
         'error',
         { ignoreParameters: true, ignoreProperties: true },
       ],
+      '@typescript-eslint/consistent-type-imports': [
+        'error',
+        { disallowTypeAnnotations: false },
+      ],
       '@typescript-eslint/no-namespace': ['error', { allowDeclarations: true }],
       '@typescript-eslint/no-unused-vars': [
         'error',
@@ -112,6 +122,8 @@ export default tseslint.config(
           caughtErrorsIgnorePattern: '^_',
         },
       ],
+      // Prevent async errors from bypassing catch handlers
+      '@typescript-eslint/return-await': ['error', 'in-try-catch'],
       'import/no-internal-modules': [
         'error',
         {
@@ -153,12 +165,50 @@ export default tseslint.config(
       'prefer-const': ['error', { destructuring: 'all' }],
       radix: 'error',
       'default-case': 'error',
+      '@typescript-eslint/no-floating-promises': ['error'],
+    },
+  },
+  {
+    // Prevent self-imports in packages
+    files: ['packages/core/src/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          name: '@google/gemini-cli-core',
+          message: 'Please use relative imports within the @google/gemini-cli-core package.',
+        },
+      ],
+    },
+  },
+  {
+    files: ['packages/cli/src/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          name: '@google/gemini-cli',
+          message: 'Please use relative imports within the @google/gemini-cli package.',
+        },
+      ],
+    },
+  },
+  {
+    files: ['packages/*/src/**/*.test.{ts,tsx}'],
+    plugins: {
+      vitest,
+    },
+    rules: {
+      ...vitest.configs.recommended.rules,
+      'vitest/expect-expect': 'off',
+      'vitest/no-commented-out-tests': 'off',
     },
   },
   {
     files: ['./**/*.{tsx,ts,js}'],
     plugins: {
       'license-header': licenseHeader,
+      import: importPlugin,
     },
     rules: {
       'license-header/header': [
@@ -171,6 +221,7 @@ export default tseslint.config(
           ' */',
         ],
       ],
+      'import/enforce-node-protocol-usage': ['error', 'always'],
     },
   },
   // extra settings for scripts that we run directly with node

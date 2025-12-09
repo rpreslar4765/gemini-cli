@@ -5,18 +5,14 @@
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-  afterEach,
-  Mocked,
-} from 'vitest';
+import type { Mocked } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { safeJsonStringify } from '../utils/safeJsonStringify.js';
 import { DiscoveredMCPTool, generateValidName } from './mcp-tool.js'; // Added getStringifiedResultForDisplay
-import { ToolResult, ToolConfirmationOutcome } from './tools.js'; // Added ToolConfirmationOutcome
-import { CallableTool, Part } from '@google/genai';
+import type { ToolResult } from './tools.js';
+import { ToolConfirmationOutcome } from './tools.js'; // Added ToolConfirmationOutcome
+import type { CallableTool, Part } from '@google/genai';
+import { ToolErrorType } from './tool-error.js';
 
 // Mock @google/genai mcpToTool and CallableTool
 // We only need to mock the parts of CallableTool that DiscoveredMCPTool uses.
@@ -28,6 +24,18 @@ const mockCallableToolInstance: Mocked<CallableTool> = {
   callTool: mockCallTool as any,
   // Add other methods if DiscoveredMCPTool starts using them
 };
+
+const createSdkResponse = (
+  toolName: string,
+  response: Record<string, any>,
+): Part[] => [
+  {
+    functionResponse: {
+      name: toolName,
+      response,
+    },
+  },
+];
 
 describe('generateValidName', () => {
   it('should return a valid name for a simple function', () => {
@@ -50,17 +58,16 @@ describe('generateValidName', () => {
     expect(generateValidName('!@#$%^&*()')).toBe('__________');
   });
 
-  it('should handle names that are exactly 63 characters long', () => {
-    expect(generateValidName('a'.repeat(63)).length).toBe(63);
-  });
-
-  it('should handle names that are exactly 64 characters long', () => {
-    expect(generateValidName('a'.repeat(64)).length).toBe(63);
-  });
-
-  it('should handle names that are longer than 64 characters', () => {
-    expect(generateValidName('a'.repeat(80)).length).toBe(63);
-  });
+  it.each([
+    { length: 63, expected: 63, description: 'exactly 63 characters' },
+    { length: 64, expected: 63, description: 'exactly 64 characters' },
+    { length: 80, expected: 63, description: 'longer than 64 characters' },
+  ])(
+    'should handle names that are $description long',
+    ({ length, expected }) => {
+      expect(generateValidName('a'.repeat(length)).length).toBe(expected);
+    },
+  );
 });
 
 describe('DiscoveredMCPTool', () => {
@@ -102,20 +109,6 @@ describe('DiscoveredMCPTool', () => {
       expect(tool.schema.parameters).toBeUndefined();
       expect(tool.schema.parametersJsonSchema).toEqual(inputSchema);
       expect(tool.serverToolName).toBe(serverToolName);
-      expect(tool.timeout).toBeUndefined();
-    });
-
-    it('should accept and store a custom timeout', () => {
-      const customTimeout = 5000;
-      const toolWithTimeout = new DiscoveredMCPTool(
-        mockCallableToolInstance,
-        serverName,
-        serverToolName,
-        baseDescription,
-        inputSchema,
-        customTimeout,
-      );
-      expect(toolWithTimeout.timeout).toBe(customTimeout);
     });
   });
 
@@ -189,7 +182,7 @@ describe('DiscoveredMCPTool', () => {
       { isErrorValue: true, description: 'true (bool)' },
       { isErrorValue: 'true', description: '"true" (str)' },
     ])(
-      'should consider a ToolResult with isError $description to be a failure',
+      'should return a structured error if MCP tool reports an error',
       async ({ isErrorValue }) => {
         const tool = new DiscoveredMCPTool(
           mockCallableToolInstance,
@@ -199,6 +192,10 @@ describe('DiscoveredMCPTool', () => {
           inputSchema,
         );
         const params = { param: 'isErrorTrueCase' };
+        const functionCall = {
+          name: serverToolName,
+          args: params,
+        };
 
         const errorResponse = { isError: isErrorValue };
         const mockMcpToolResponseParts: Part[] = [
@@ -210,16 +207,19 @@ describe('DiscoveredMCPTool', () => {
           },
         ];
         mockCallTool.mockResolvedValue(mockMcpToolResponseParts);
-        const expectedError = new Error(
-          `MCP tool '${serverToolName}' reported tool error with response: ${JSON.stringify(
-            mockMcpToolResponseParts,
-          )}`,
-        );
-
+        const expectedErrorMessage = `MCP tool '${
+          serverToolName
+        }' reported tool error for function call: ${safeJsonStringify(
+          functionCall,
+        )} with response: ${safeJsonStringify(mockMcpToolResponseParts)}`;
         const invocation = tool.build(params);
-        await expect(
-          invocation.execute(new AbortController().signal),
-        ).rejects.toThrow(expectedError);
+        const result = await invocation.execute(new AbortController().signal);
+
+        expect(result.error?.type).toBe(ToolErrorType.MCP_TOOL_ERROR);
+        expect(result.llmContent).toBe(expectedErrorMessage);
+        expect(result.returnDisplay).toContain(
+          `Error: MCP tool '${serverToolName}' reported an error.`,
+        );
       },
     );
 
@@ -281,20 +281,11 @@ describe('DiscoveredMCPTool', () => {
       const params = { param: 'test' };
       const successMessage = 'This is a success message.';
 
-      // Simulate the response from the GenAI SDK, which wraps the MCP
-      // response in a functionResponse Part.
-      const sdkResponse: Part[] = [
-        {
-          functionResponse: {
-            name: serverToolName,
-            response: {
-              // The `content` array contains MCP ContentBlocks.
-              content: [{ type: 'text', text: successMessage }],
-            },
-          },
-        },
-      ];
-      mockCallTool.mockResolvedValue(sdkResponse);
+      mockCallTool.mockResolvedValue(
+        createSdkResponse(serverToolName, {
+          content: [{ type: 'text', text: successMessage }],
+        }),
+      );
 
       const invocation = tool.build(params);
       const toolResult = await invocation.execute(new AbortController().signal);
@@ -313,23 +304,17 @@ describe('DiscoveredMCPTool', () => {
 
     it('should handle an AudioBlock response', async () => {
       const params = { param: 'play' };
-      const sdkResponse: Part[] = [
-        {
-          functionResponse: {
-            name: serverToolName,
-            response: {
-              content: [
-                {
-                  type: 'audio',
-                  data: 'BASE64_AUDIO_DATA',
-                  mimeType: 'audio/mp3',
-                },
-              ],
+      mockCallTool.mockResolvedValue(
+        createSdkResponse(serverToolName, {
+          content: [
+            {
+              type: 'audio',
+              data: 'BASE64_AUDIO_DATA',
+              mimeType: 'audio/mp3',
             },
-          },
-        },
-      ];
-      mockCallTool.mockResolvedValue(sdkResponse);
+          ],
+        }),
+      );
 
       const invocation = tool.build(params);
       const toolResult = await invocation.execute(new AbortController().signal);
@@ -350,24 +335,18 @@ describe('DiscoveredMCPTool', () => {
 
     it('should handle a ResourceLinkBlock response', async () => {
       const params = { param: 'get' };
-      const sdkResponse: Part[] = [
-        {
-          functionResponse: {
-            name: serverToolName,
-            response: {
-              content: [
-                {
-                  type: 'resource_link',
-                  uri: 'file:///path/to/thing',
-                  name: 'resource-name',
-                  title: 'My Resource',
-                },
-              ],
+      mockCallTool.mockResolvedValue(
+        createSdkResponse(serverToolName, {
+          content: [
+            {
+              type: 'resource_link',
+              uri: 'file:///path/to/thing',
+              name: 'resource-name',
+              title: 'My Resource',
             },
-          },
-        },
-      ];
-      mockCallTool.mockResolvedValue(sdkResponse);
+          ],
+        }),
+      );
 
       const invocation = tool.build(params);
       const toolResult = await invocation.execute(new AbortController().signal);
@@ -384,26 +363,20 @@ describe('DiscoveredMCPTool', () => {
 
     it('should handle an embedded text ResourceBlock response', async () => {
       const params = { param: 'get' };
-      const sdkResponse: Part[] = [
-        {
-          functionResponse: {
-            name: serverToolName,
-            response: {
-              content: [
-                {
-                  type: 'resource',
-                  resource: {
-                    uri: 'file:///path/to/text.txt',
-                    text: 'This is the text content.',
-                    mimeType: 'text/plain',
-                  },
-                },
-              ],
+      mockCallTool.mockResolvedValue(
+        createSdkResponse(serverToolName, {
+          content: [
+            {
+              type: 'resource',
+              resource: {
+                uri: 'file:///path/to/text.txt',
+                text: 'This is the text content.',
+                mimeType: 'text/plain',
+              },
             },
-          },
-        },
-      ];
-      mockCallTool.mockResolvedValue(sdkResponse);
+          ],
+        }),
+      );
 
       const invocation = tool.build(params);
       const toolResult = await invocation.execute(new AbortController().signal);
@@ -416,26 +389,20 @@ describe('DiscoveredMCPTool', () => {
 
     it('should handle an embedded binary ResourceBlock response', async () => {
       const params = { param: 'get' };
-      const sdkResponse: Part[] = [
-        {
-          functionResponse: {
-            name: serverToolName,
-            response: {
-              content: [
-                {
-                  type: 'resource',
-                  resource: {
-                    uri: 'file:///path/to/data.bin',
-                    blob: 'BASE64_BINARY_DATA',
-                    mimeType: 'application/octet-stream',
-                  },
-                },
-              ],
+      mockCallTool.mockResolvedValue(
+        createSdkResponse(serverToolName, {
+          content: [
+            {
+              type: 'resource',
+              resource: {
+                uri: 'file:///path/to/data.bin',
+                blob: 'BASE64_BINARY_DATA',
+                mimeType: 'application/octet-stream',
+              },
             },
-          },
-        },
-      ];
-      mockCallTool.mockResolvedValue(sdkResponse);
+          ],
+        }),
+      );
 
       const invocation = tool.build(params);
       const toolResult = await invocation.execute(new AbortController().signal);
@@ -458,25 +425,19 @@ describe('DiscoveredMCPTool', () => {
 
     it('should handle a mix of content block types', async () => {
       const params = { param: 'complex' };
-      const sdkResponse: Part[] = [
-        {
-          functionResponse: {
-            name: serverToolName,
-            response: {
-              content: [
-                { type: 'text', text: 'First part.' },
-                {
-                  type: 'image',
-                  data: 'BASE64_IMAGE_DATA',
-                  mimeType: 'image/jpeg',
-                },
-                { type: 'text', text: 'Second part.' },
-              ],
+      mockCallTool.mockResolvedValue(
+        createSdkResponse(serverToolName, {
+          content: [
+            { type: 'text', text: 'First part.' },
+            {
+              type: 'image',
+              data: 'BASE64_IMAGE_DATA',
+              mimeType: 'image/jpeg',
             },
-          },
-        },
-      ];
-      mockCallTool.mockResolvedValue(sdkResponse);
+            { type: 'text', text: 'Second part.' },
+          ],
+        }),
+      );
 
       const invocation = tool.build(params);
       const toolResult = await invocation.execute(new AbortController().signal);
@@ -501,20 +462,14 @@ describe('DiscoveredMCPTool', () => {
 
     it('should ignore unknown content block types', async () => {
       const params = { param: 'test' };
-      const sdkResponse: Part[] = [
-        {
-          functionResponse: {
-            name: serverToolName,
-            response: {
-              content: [
-                { type: 'text', text: 'Valid part.' },
-                { type: 'future_block', data: 'some-data' },
-              ],
-            },
-          },
-        },
-      ];
-      mockCallTool.mockResolvedValue(sdkResponse);
+      mockCallTool.mockResolvedValue(
+        createSdkResponse(serverToolName, {
+          content: [
+            { type: 'text', text: 'Valid part.' },
+            { type: 'future_block', data: 'some-data' },
+          ],
+        }),
+      );
 
       const invocation = tool.build(params);
       const toolResult = await invocation.execute(new AbortController().signal);
@@ -527,38 +482,32 @@ describe('DiscoveredMCPTool', () => {
 
     it('should handle a complex mix of content block types', async () => {
       const params = { param: 'super-complex' };
-      const sdkResponse: Part[] = [
-        {
-          functionResponse: {
-            name: serverToolName,
-            response: {
-              content: [
-                { type: 'text', text: 'Here is a resource.' },
-                {
-                  type: 'resource_link',
-                  uri: 'file:///path/to/resource',
-                  name: 'resource-name',
-                  title: 'My Resource',
-                },
-                {
-                  type: 'resource',
-                  resource: {
-                    uri: 'file:///path/to/text.txt',
-                    text: 'Embedded text content.',
-                    mimeType: 'text/plain',
-                  },
-                },
-                {
-                  type: 'image',
-                  data: 'BASE64_IMAGE_DATA',
-                  mimeType: 'image/jpeg',
-                },
-              ],
+      mockCallTool.mockResolvedValue(
+        createSdkResponse(serverToolName, {
+          content: [
+            { type: 'text', text: 'Here is a resource.' },
+            {
+              type: 'resource_link',
+              uri: 'file:///path/to/resource',
+              name: 'resource-name',
+              title: 'My Resource',
             },
-          },
-        },
-      ];
-      mockCallTool.mockResolvedValue(sdkResponse);
+            {
+              type: 'resource',
+              resource: {
+                uri: 'file:///path/to/text.txt',
+                text: 'Embedded text content.',
+                mimeType: 'text/plain',
+              },
+            },
+            {
+              type: 'image',
+              data: 'BASE64_IMAGE_DATA',
+              mimeType: 'image/jpeg',
+            },
+          ],
+        }),
+      );
 
       const invocation = tool.build(params);
       const toolResult = await invocation.execute(new AbortController().signal);
@@ -583,6 +532,154 @@ describe('DiscoveredMCPTool', () => {
         'Here is a resource.\n[Link to My Resource: file:///path/to/resource]\nEmbedded text content.\n[Image: image/jpeg]',
       );
     });
+
+    describe('AbortSignal support', () => {
+      const MOCK_TOOL_DELAY = 1000;
+      const ABORT_DELAY = 50;
+
+      it('should abort immediately if signal is already aborted', async () => {
+        const params = { param: 'test' };
+        const controller = new AbortController();
+        controller.abort();
+
+        const invocation = tool.build(params);
+
+        await expect(invocation.execute(controller.signal)).rejects.toThrow(
+          'Tool call aborted',
+        );
+
+        // Tool should not be called if signal is already aborted
+        expect(mockCallTool).not.toHaveBeenCalled();
+      });
+
+      it('should abort during tool execution', async () => {
+        const params = { param: 'test' };
+        const controller = new AbortController();
+
+        // Mock a delayed response to simulate long-running tool
+        mockCallTool.mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              setTimeout(() => {
+                resolve([
+                  {
+                    functionResponse: {
+                      name: serverToolName,
+                      response: {
+                        content: [{ type: 'text', text: 'Success' }],
+                      },
+                    },
+                  },
+                ]);
+              }, MOCK_TOOL_DELAY);
+            }),
+        );
+
+        const invocation = tool.build(params);
+        const promise = invocation.execute(controller.signal);
+
+        // Abort after a short delay to simulate cancellation during execution
+        setTimeout(() => controller.abort(), ABORT_DELAY);
+
+        await expect(promise).rejects.toThrow('Tool call aborted');
+      });
+
+      it('should complete successfully if not aborted', async () => {
+        const params = { param: 'test' };
+        const controller = new AbortController();
+
+        mockCallTool.mockResolvedValue(
+          createSdkResponse(serverToolName, {
+            content: [{ type: 'text', text: 'Success' }],
+          }),
+        );
+
+        const invocation = tool.build(params);
+        const result = await invocation.execute(controller.signal);
+
+        expect(result.llmContent).toEqual([{ text: 'Success' }]);
+        expect(result.returnDisplay).toBe('Success');
+        expect(mockCallTool).toHaveBeenCalledWith([
+          { name: serverToolName, args: params },
+        ]);
+      });
+
+      it('should handle tool error even when abort signal is provided', async () => {
+        const params = { param: 'test' };
+        const controller = new AbortController();
+
+        mockCallTool.mockResolvedValue(
+          createSdkResponse(serverToolName, { error: { isError: true } }),
+        );
+
+        const invocation = tool.build(params);
+        const result = await invocation.execute(controller.signal);
+
+        expect(result.error?.type).toBe(ToolErrorType.MCP_TOOL_ERROR);
+        expect(result.returnDisplay).toContain(
+          `Error: MCP tool '${serverToolName}' reported an error.`,
+        );
+      });
+
+      it('should handle callTool rejection with abort signal', async () => {
+        const params = { param: 'test' };
+        const controller = new AbortController();
+        const expectedError = new Error('Network error');
+
+        mockCallTool.mockRejectedValue(expectedError);
+
+        const invocation = tool.build(params);
+
+        await expect(invocation.execute(controller.signal)).rejects.toThrow(
+          expectedError,
+        );
+      });
+
+      it.each([
+        {
+          name: 'successful completion',
+          setup: () => {
+            mockCallTool.mockResolvedValue(
+              createSdkResponse(serverToolName, {
+                content: [{ type: 'text', text: 'Success' }],
+              }),
+            );
+          },
+          expectError: false,
+        },
+        {
+          name: 'error',
+          setup: () => {
+            mockCallTool.mockRejectedValue(new Error('Tool execution failed'));
+          },
+          expectError: true,
+        },
+      ])(
+        'should cleanup event listeners properly on $name',
+        async ({ setup, expectError }) => {
+          const params = { param: 'test' };
+          const controller = new AbortController();
+
+          setup();
+
+          const invocation = tool.build(params);
+
+          if (expectError) {
+            try {
+              await invocation.execute(controller.signal);
+            } catch (_error) {
+              // Expected error
+            }
+          } else {
+            await invocation.execute(controller.signal);
+          }
+
+          // Verify cleanup by aborting after execution
+          controller.abort();
+          expect(controller.signal.aborted).toBe(true);
+        },
+      );
+    });
   });
 
   describe('shouldConfirmExecute', () => {
@@ -593,8 +690,9 @@ describe('DiscoveredMCPTool', () => {
         serverToolName,
         baseDescription,
         inputSchema,
-        undefined,
         true,
+        undefined,
+        { isTrustedFolder: () => true } as any,
       );
       const invocation = trustedTool.build({ param: 'mock' });
       expect(
@@ -642,104 +740,110 @@ describe('DiscoveredMCPTool', () => {
       }
     });
 
-    it('should add server to allowlist on ProceedAlwaysServer', async () => {
-      const invocation = tool.build({ param: 'mock' }) as any;
-      const confirmation = await invocation.shouldConfirmExecute(
-        new AbortController().signal,
-      );
-      expect(confirmation).not.toBe(false);
-      if (
-        confirmation &&
-        typeof confirmation === 'object' &&
-        'onConfirm' in confirmation &&
-        typeof confirmation.onConfirm === 'function'
-      ) {
-        await confirmation.onConfirm(
-          ToolConfirmationOutcome.ProceedAlwaysServer,
+    it.each([
+      {
+        outcome: ToolConfirmationOutcome.ProceedAlwaysServer,
+        description: 'add server to allowlist on ProceedAlwaysServer',
+        shouldAddServer: true,
+        shouldAddTool: false,
+      },
+      {
+        outcome: ToolConfirmationOutcome.ProceedAlwaysTool,
+        description: 'add tool to allowlist on ProceedAlwaysTool',
+        shouldAddServer: false,
+        shouldAddTool: true,
+      },
+      {
+        outcome: ToolConfirmationOutcome.Cancel,
+        description: 'handle Cancel confirmation outcome',
+        shouldAddServer: false,
+        shouldAddTool: false,
+      },
+      {
+        outcome: ToolConfirmationOutcome.ProceedOnce,
+        description: 'handle ProceedOnce confirmation outcome',
+        shouldAddServer: false,
+        shouldAddTool: false,
+      },
+    ])(
+      'should $description',
+      async ({ outcome, shouldAddServer, shouldAddTool }) => {
+        const toolAllowlistKey = `${serverName}.${serverToolName}`;
+        const invocation = tool.build({ param: 'mock' }) as any;
+        const confirmation = await invocation.shouldConfirmExecute(
+          new AbortController().signal,
         );
-        expect(invocation.constructor.allowlist.has(serverName)).toBe(true);
-      } else {
-        throw new Error(
-          'Confirmation details or onConfirm not in expected format',
-        );
-      }
+
+        expect(confirmation).not.toBe(false);
+        if (
+          confirmation &&
+          typeof confirmation === 'object' &&
+          'onConfirm' in confirmation &&
+          typeof confirmation.onConfirm === 'function'
+        ) {
+          await confirmation.onConfirm(outcome);
+          expect(invocation.constructor.allowlist.has(serverName)).toBe(
+            shouldAddServer,
+          );
+          expect(invocation.constructor.allowlist.has(toolAllowlistKey)).toBe(
+            shouldAddTool,
+          );
+        } else {
+          throw new Error(
+            'Confirmation details or onConfirm not in expected format',
+          );
+        }
+      },
+    );
+  });
+
+  describe('shouldConfirmExecute with folder trust', () => {
+    const mockConfig = (isTrusted: boolean | undefined) => ({
+      isTrustedFolder: () => isTrusted,
     });
 
-    it('should add tool to allowlist on ProceedAlwaysTool', async () => {
-      const toolAllowlistKey = `${serverName}.${serverToolName}`;
-      const invocation = tool.build({ param: 'mock' }) as any;
+    it.each([
+      {
+        trust: true,
+        isTrusted: true,
+        shouldConfirm: false,
+        description: 'return false if trust is true and folder is trusted',
+      },
+      {
+        trust: true,
+        isTrusted: false,
+        shouldConfirm: true,
+        description:
+          'return confirmation details if trust is true but folder is not trusted',
+      },
+      {
+        trust: false,
+        isTrusted: true,
+        shouldConfirm: true,
+        description:
+          'return confirmation details if trust is false, even if folder is trusted',
+      },
+    ])('should $description', async ({ trust, isTrusted, shouldConfirm }) => {
+      const testTool = new DiscoveredMCPTool(
+        mockCallableToolInstance,
+        serverName,
+        serverToolName,
+        baseDescription,
+        inputSchema,
+        trust,
+        undefined,
+        mockConfig(isTrusted) as any,
+      );
+      const invocation = testTool.build({ param: 'mock' });
       const confirmation = await invocation.shouldConfirmExecute(
         new AbortController().signal,
       );
-      expect(confirmation).not.toBe(false);
-      if (
-        confirmation &&
-        typeof confirmation === 'object' &&
-        'onConfirm' in confirmation &&
-        typeof confirmation.onConfirm === 'function'
-      ) {
-        await confirmation.onConfirm(ToolConfirmationOutcome.ProceedAlwaysTool);
-        expect(invocation.constructor.allowlist.has(toolAllowlistKey)).toBe(
-          true,
-        );
-      } else {
-        throw new Error(
-          'Confirmation details or onConfirm not in expected format',
-        );
-      }
-    });
 
-    it('should handle Cancel confirmation outcome', async () => {
-      const invocation = tool.build({ param: 'mock' }) as any;
-      const confirmation = await invocation.shouldConfirmExecute(
-        new AbortController().signal,
-      );
-      expect(confirmation).not.toBe(false);
-      if (
-        confirmation &&
-        typeof confirmation === 'object' &&
-        'onConfirm' in confirmation &&
-        typeof confirmation.onConfirm === 'function'
-      ) {
-        // Cancel should not add anything to allowlist
-        await confirmation.onConfirm(ToolConfirmationOutcome.Cancel);
-        expect(invocation.constructor.allowlist.has(serverName)).toBe(false);
-        expect(
-          invocation.constructor.allowlist.has(
-            `${serverName}.${serverToolName}`,
-          ),
-        ).toBe(false);
+      if (shouldConfirm) {
+        expect(confirmation).not.toBe(false);
+        expect(confirmation).toHaveProperty('type', 'mcp');
       } else {
-        throw new Error(
-          'Confirmation details or onConfirm not in expected format',
-        );
-      }
-    });
-
-    it('should handle ProceedOnce confirmation outcome', async () => {
-      const invocation = tool.build({ param: 'mock' }) as any;
-      const confirmation = await invocation.shouldConfirmExecute(
-        new AbortController().signal,
-      );
-      expect(confirmation).not.toBe(false);
-      if (
-        confirmation &&
-        typeof confirmation === 'object' &&
-        'onConfirm' in confirmation &&
-        typeof confirmation.onConfirm === 'function'
-      ) {
-        // ProceedOnce should not add anything to allowlist
-        await confirmation.onConfirm(ToolConfirmationOutcome.ProceedOnce);
-        expect(invocation.constructor.allowlist.has(serverName)).toBe(false);
-        expect(
-          invocation.constructor.allowlist.has(
-            `${serverName}.${serverToolName}`,
-          ),
-        ).toBe(false);
-      } else {
-        throw new Error(
-          'Confirmation details or onConfirm not in expected format',
-        );
+        expect(confirmation).toBe(false);
       }
     });
   });

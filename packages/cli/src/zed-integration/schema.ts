@@ -24,6 +24,12 @@ export const CLIENT_METHODS = {
 
 export const PROTOCOL_VERSION = 1;
 
+export const authMethodSchema = z.object({
+  description: z.string().nullable(),
+  id: z.string(),
+  name: z.string(),
+});
+
 export type WriteTextFileRequest = z.infer<typeof writeTextFileRequestSchema>;
 
 export type ReadTextFileRequest = z.infer<typeof readTextFileRequestSchema>;
@@ -84,6 +90,8 @@ export type AgentCapabilities = z.infer<typeof agentCapabilitiesSchema>;
 
 export type AuthMethod = z.infer<typeof authMethodSchema>;
 
+export type PromptCapabilities = z.infer<typeof promptCapabilitiesSchema>;
+
 export type ClientResponse = z.infer<typeof clientResponseSchema>;
 
 export type ClientNotification = z.infer<typeof clientNotificationSchema>;
@@ -125,6 +133,20 @@ export type ClientRequest = z.infer<typeof clientRequestSchema>;
 export type AgentRequest = z.infer<typeof agentRequestSchema>;
 
 export type AgentNotification = z.infer<typeof agentNotificationSchema>;
+
+export type Result<T> =
+  | {
+      result: T;
+    }
+  | {
+      error: ErrorResponse;
+    };
+
+export type ErrorResponse = {
+  code: number;
+  message: string;
+  data?: unknown;
+};
 
 export const writeTextFileRequestSchema = z.object({
   content: z.string(),
@@ -270,14 +292,15 @@ export const mcpServerSchema = z.object({
   name: z.string(),
 });
 
-export const agentCapabilitiesSchema = z.object({
-  loadSession: z.boolean(),
+export const promptCapabilitiesSchema = z.object({
+  audio: z.boolean().optional(),
+  embeddedContext: z.boolean().optional(),
+  image: z.boolean().optional(),
 });
 
-export const authMethodSchema = z.object({
-  description: z.string().nullable(),
-  id: z.string(),
-  name: z.string(),
+export const agentCapabilitiesSchema = z.object({
+  loadSession: z.boolean().optional(),
+  promptCapabilities: promptCapabilitiesSchema.optional(),
 });
 
 export const clientResponseSchema = z.union([
