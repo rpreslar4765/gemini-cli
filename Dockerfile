@@ -1,3 +1,21 @@
+# Stage 1: Build the application
+FROM docker.io/library/node:20-slim as builder
+
+WORKDIR /app
+
+# Copy all the source code
+COPY . .
+
+# Install dependencies and build the project
+RUN npm install
+RUN npm run build
+
+# Bundle the application
+RUN npm run bundle
+
+# ---
+
+# Stage 2: Production image
 FROM docker.io/library/node:20-slim
 
 ARG SANDBOX_NAME="gemini-cli-sandbox"
@@ -39,12 +57,11 @@ ENV PATH=$PATH:/usr/local/share/npm-global/bin
 # switch to non-root user node
 USER node
 
-# install gemini-cli and clean up
-COPY packages/cli/dist/google-gemini-cli-*.tgz /tmp/gemini-cli.tgz
-COPY packages/core/dist/google-gemini-cli-core-*.tgz /tmp/gemini-core.tgz
-RUN npm install -g /tmp/gemini-cli.tgz /tmp/gemini-core.tgz \
-  && npm cache clean --force \
-  && rm -f /tmp/gemini-{cli,core}.tgz
+# Copy the bundled application from the builder stage
+COPY --from=builder /app/bundle /app/bundle
+
+# Install the application globally
+RUN npm install -g /app/bundle
 
 # default entrypoint when none specified
 CMD ["gemini"]
