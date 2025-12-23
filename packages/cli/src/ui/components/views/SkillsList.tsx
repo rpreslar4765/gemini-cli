@@ -38,7 +38,11 @@ export const SkillsList: React.FC<SkillsListProps> = ({
         </Text>
         {showDescriptions && skill.description && (
           <Box marginLeft={2}>
-            <Text color={theme.text.secondary}>{skill.description}</Text>
+            <Text
+              color={skill.disabled ? theme.text.secondary : theme.text.primary}
+            >
+              {skill.description}
+            </Text>
           </Box>
         )}
       </Box>
