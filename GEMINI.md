@@ -1,3 +1,26 @@
+## Pawnpay Integration
+
+When running inside the Pawnpay Podman stack, Gemini CLI has access to the
+following services via environment variables:
+
+| Variable | Description |
+|---|---|
+| `PAWNPAY_API_URL` | Pawndex API base URL (e.g. `http://pawndex:8000/api/v1`) |
+| `PAWNPAY_API_KEY` | Pawndex API authentication key |
+| `N8N_WEBHOOK_URL` | n8n webhook base (e.g. `http://n8n:5678/webhook`) |
+| `PPS_SYNC_URL` | PPS-Sync webhook server (e.g. `http://pps-sync-scheduler:8090`) |
+
+**Store codes:** NORTH, SOUTH, EAST, WEST, CONWAY
+
+**Key n8n webhook actions:**
+- `POST $N8N_WEBHOOK_URL/sync-trigger` — trigger store sync
+- `POST $N8N_WEBHOOK_URL/ai-analyze` — run AI analysis
+- `GET  $N8N_WEBHOOK_URL/health` — check stack health
+
+See `docs/pawnpay-integration.md` for full usage details.
+
+---
+
 ## Building and running
 
 Before submitting any changes, it is crucial to validate them by running the
